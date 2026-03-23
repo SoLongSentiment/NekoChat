@@ -9,19 +9,15 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <unordered_set>
 
 #include "STUN.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 
-enum CandidateType
-{
-    HOST,
-    SERVER_REFLEXIVE
-};
+enum CandidateType { HOST, SERVER_REFLEXIVE };
 
-struct Candidate
-{
+struct Candidate {
     CandidateType type;
     std::string ip;
     uint16_t port;
@@ -29,39 +25,29 @@ struct Candidate
     std::string relatedIp;
     uint16_t relatedPort;
 
-    Candidate() : type(HOST), port(0), relatedPort(0), sock(INVALID_SOCKET)
-    {
-    }
+    Candidate() : type(HOST), port(0), relatedPort(0), sock(INVALID_SOCKET) {}
 };
 
-class CandidateGatherer
-{
-  public:
-    using CandidateCallback =
-        std::function<void(std::vector<Candidate> candidates)>;
+class CandidateGatherer {
+public:
+    using CandidateCallback = std::function<void(std::vector<Candidate> candidates)>;
 
-    CandidateGatherer()
-    {
+    CandidateGatherer() {
         InitializeCriticalSection(&m_cs);
     }
 
-    ~CandidateGatherer()
-    {
+    ~CandidateGatherer() {
         CloseCurrentSocket();
         DeleteCriticalSection(&m_cs);
     }
 
-    bool StartGathering(const char *stunHost, uint16_t stunPort,
-                        CandidateCallback callback)
-    {
+    bool StartGathering(const char* stunHost, uint16_t stunPort, CandidateCallback callback) {
         {
             CSGuard guard(m_cs);
-            if (m_gatherSocket != INVALID_SOCKET && !m_cachedCandidates.empty())
-            {
+            if (m_gatherSocket != INVALID_SOCKET && !m_cachedCandidates.empty()) {
                 std::vector<Candidate> cacheCopy = m_cachedCandidates;
                 guard.Leave();
-                if (callback)
-                {
+                if (callback) {
                     callback(cacheCopy);
                 }
                 return true;
@@ -71,50 +57,36 @@ class CandidateGatherer
         CloseCurrentSocket();
 
         SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock == INVALID_SOCKET)
-        {
-            if (callback)
-            {
+        if (sock == INVALID_SOCKET) {
+            if (callback) {
                 callback({});
             }
             return false;
         }
 
         int udpBufferSize = 256 * 1024;
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
-                   reinterpret_cast<const char *>(&udpBufferSize),
-                   sizeof(udpBufferSize));
-        setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
-                   reinterpret_cast<const char *>(&udpBufferSize),
-                   sizeof(udpBufferSize));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&udpBufferSize), sizeof(udpBufferSize));
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&udpBufferSize), sizeof(udpBufferSize));
 
         sockaddr_in localAddr{};
         localAddr.sin_family = AF_INET;
         localAddr.sin_addr.s_addr = INADDR_ANY;
         localAddr.sin_port = 0;
 
-        if (bind(sock, reinterpret_cast<sockaddr *>(&localAddr),
-                 sizeof(localAddr)) == SOCKET_ERROR)
-        {
-            std::cerr << "[Gatherer] Bind failed: " << WSAGetLastError()
-                      << std::endl;
+        if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+            std::cerr << "[Gatherer] Bind failed: " << WSAGetLastError() << std::endl;
             closesocket(sock);
-            if (callback)
-            {
+            if (callback) {
                 callback({});
             }
             return false;
         }
 
         int len = sizeof(localAddr);
-        if (getsockname(sock, reinterpret_cast<sockaddr *>(&localAddr), &len) ==
-            SOCKET_ERROR)
-        {
-            std::cerr << "[Gatherer] getsockname failed: " << WSAGetLastError()
-                      << std::endl;
+        if (getsockname(sock, reinterpret_cast<sockaddr*>(&localAddr), &len) == SOCKET_ERROR) {
+            std::cerr << "[Gatherer] getsockname failed: " << WSAGetLastError() << std::endl;
             closesocket(sock);
-            if (callback)
-            {
+            if (callback) {
                 callback({});
             }
             return false;
@@ -124,41 +96,52 @@ class CandidateGatherer
         inet_ntop(AF_INET, &localAddr.sin_addr, hostIp, sizeof(hostIp));
         uint16_t hostPort = ntohs(localAddr.sin_port);
 
-        std::string finalHostIp = hostIp;
-        if (finalHostIp == "0.0.0.0" || std::strlen(hostIp) == 0)
-        {
-            auto ips = GetLocalIPv4Addresses();
-            if (!ips.empty())
-            {
-                finalHostIp = ips[0];
+        std::vector<std::string> hostIps;
+        hostIps.reserve(8);
+
+        auto appendUniqueIp = [&hostIps](const std::string& ip) {
+            if (ip.empty() || ip == "0.0.0.0") {
+                return;
             }
+
+            for (const auto& existing : hostIps) {
+                if (existing == ip) {
+                    return;
+                }
+            }
+            hostIps.push_back(ip);
+        };
+
+        std::string preferredHostIp = hostIp;
+        appendUniqueIp(preferredHostIp);
+        for (const auto& ip : GetLocalIPv4Addresses()) {
+            appendUniqueIp(ip);
+        }
+
+        if (!hostIps.empty()) {
+            preferredHostIp = hostIps.front();
         }
 
         std::vector<Candidate> candidates;
-        candidates.reserve(2);
+        candidates.reserve(hostIps.size() + 1);
 
-        {
+        for (const auto& ip : hostIps) {
             Candidate cand;
             cand.type = HOST;
-            cand.ip = finalHostIp;
+            cand.ip = ip;
             cand.port = hostPort;
             cand.sock = sock;
             candidates.push_back(cand);
+
+            std::cout << "[Gatherer] Host candidate: " << ip << ":" << hostPort << std::endl;
         }
-        std::cout << "[Gatherer] Host candidate: " << finalHostIp << ":"
-                  << hostPort << std::endl;
 
         sockaddr_in reflexiveAddr{};
-        bool stunOk = StunClient::GetReflexiveAddress(stunHost, stunPort, sock,
-                                                      reflexiveAddr);
+        bool stunOk = StunClient::GetReflexiveAddress(stunHost, stunPort, sock, reflexiveAddr);
 
-        if (stunOk && reflexiveAddr.sin_addr.s_addr != INADDR_ANY &&
-            reflexiveAddr.sin_addr.s_addr != 0)
-        {
+        if (stunOk && reflexiveAddr.sin_addr.s_addr != INADDR_ANY && reflexiveAddr.sin_addr.s_addr != 0) {
             char srflxIp[INET_ADDRSTRLEN];
-            if (inet_ntop(AF_INET, &reflexiveAddr.sin_addr, srflxIp,
-                          sizeof(srflxIp)))
-            {
+            if (inet_ntop(AF_INET, &reflexiveAddr.sin_addr, srflxIp, sizeof(srflxIp))) {
                 uint16_t srflxPort = ntohs(reflexiveAddr.sin_port);
 
                 Candidate cand;
@@ -166,18 +149,14 @@ class CandidateGatherer
                 cand.ip = srflxIp;
                 cand.port = srflxPort;
                 cand.sock = sock;
-                cand.relatedIp = finalHostIp;
+                cand.relatedIp = preferredHostIp;
                 cand.relatedPort = hostPort;
                 candidates.push_back(cand);
 
-                std::cout << "[Gatherer] SRFLX candidate found: " << srflxIp
-                          << ":" << srflxPort << std::endl;
+                std::cout << "[Gatherer] SRFLX candidate found: " << srflxIp << ":" << srflxPort << std::endl;
             }
-        }
-        else
-        {
-            std::cerr << "[Gatherer] STUN failed or timed out. Only local P2P "
-                         "might work.\n";
+        } else {
+            std::cerr << "[Gatherer] STUN failed or timed out. Only local P2P might work.\n";
         }
 
         {
@@ -187,112 +166,94 @@ class CandidateGatherer
             m_cachedCandidates = candidates;
         }
 
-        if (callback)
-        {
+        if (callback) {
             callback(candidates);
         }
         return true;
     }
 
-    std::vector<Candidate> GetCachedCandidates()
-    {
+    std::vector<Candidate> GetCachedCandidates() {
         CSGuard guard(m_cs);
         return m_cachedCandidates;
     }
 
-  private:
-    struct CSGuard
-    {
-        CRITICAL_SECTION &cs;
+private:
+    struct CSGuard {
+        CRITICAL_SECTION& cs;
         bool locked;
 
-        explicit CSGuard(CRITICAL_SECTION &c) : cs(c), locked(true)
-        {
+        explicit CSGuard(CRITICAL_SECTION& c) : cs(c), locked(true) {
             EnterCriticalSection(&cs);
         }
 
-        void Leave()
-        {
-            if (locked)
-            {
+        void Leave() {
+            if (locked) {
                 LeaveCriticalSection(&cs);
                 locked = false;
             }
         }
 
-        ~CSGuard()
-        {
-            if (locked)
-            {
+        ~CSGuard() {
+            if (locked) {
                 LeaveCriticalSection(&cs);
             }
         }
     };
 
-    void CloseCurrentSocket()
-    {
+    void CloseCurrentSocket() {
         CSGuard guard(m_cs);
-        if (m_gatherSocket != INVALID_SOCKET)
-        {
+        if (m_gatherSocket != INVALID_SOCKET) {
             closesocket(m_gatherSocket);
             m_gatherSocket = INVALID_SOCKET;
         }
     }
 
-    std::vector<std::string> GetLocalIPv4Addresses(bool includePrivate = true)
-    {
+    std::vector<std::string> GetLocalIPv4Addresses(bool includePrivate = true) {
         std::vector<std::string> ips;
         DWORD size = 0;
 
-        if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &size) !=
-            ERROR_BUFFER_OVERFLOW)
-        {
+        if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &size) != ERROR_BUFFER_OVERFLOW) {
             return ips;
         }
 
         std::vector<uint8_t> buffer(size);
-        PIP_ADAPTER_ADDRESSES adapters =
-            reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+        PIP_ADAPTER_ADDRESSES adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
 
-        if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &size) !=
-            NO_ERROR)
-        {
+        if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &size) != NO_ERROR) {
             return ips;
         }
 
-        for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next)
-        {
+        for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next) {
             if (a->OperStatus != IfOperStatusUp ||
-                a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
-                a->IfType == IF_TYPE_TUNNEL)
-            {
+                a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
                 continue;
             }
 
-            for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u;
-                 u = u->Next)
-            {
-                auto *addr =
-                    reinterpret_cast<sockaddr_in *>(u->Address.lpSockaddr);
+            for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next) {
+                if (!u->Address.lpSockaddr ||
+                    u->Address.lpSockaddr->sa_family != AF_INET ||
+                    u->DadState == IpDadStateTentative ||
+                    u->DadState == IpDadStateDuplicate ||
+                    u->DadState == IpDadStateInvalid) {
+                    continue;
+                }
+
+                auto* addr = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
                 char str[INET_ADDRSTRLEN];
 
-                if (inet_ntop(AF_INET, &addr->sin_addr, str, sizeof(str)) ==
-                    nullptr)
-                {
+                if (inet_ntop(AF_INET, &addr->sin_addr, str, sizeof(str)) == nullptr) {
                     continue;
                 }
 
                 std::string ip(str);
 
-                if (!includePrivate)
-                {
+                if (!includePrivate) {
                     uint32_t addrVal = ntohl(addr->sin_addr.s_addr);
                     if ((addrVal & 0xFF000000) == 0x0A000000 ||
                         (addrVal & 0xFFF00000) == 0xAC100000 ||
                         (addrVal & 0xFFFF0000) == 0xC0A80000 ||
                         (addrVal & 0xFF000000) == 0x7F000000 ||
-                        (addrVal & 0xFFFF0000) == 0xA9FE0000)
-                    {
+                        (addrVal & 0xFFFF0000) == 0xA9FE0000) {
                         continue;
                     }
                 }
@@ -301,7 +262,16 @@ class CandidateGatherer
             }
         }
 
-        return ips;
+        std::unordered_set<std::string> seen;
+        std::vector<std::string> uniqueIps;
+        uniqueIps.reserve(ips.size());
+        for (const auto& ip : ips) {
+            if (seen.insert(ip).second) {
+                uniqueIps.push_back(ip);
+            }
+        }
+
+        return uniqueIps;
     }
 
     CRITICAL_SECTION m_cs;
